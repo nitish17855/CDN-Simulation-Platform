@@ -1,12 +1,17 @@
+/**
+ * CDN Routing Engine
+ * Routes requests using fresh, stale-while-revalidate, and origin fallback rules.
+ */
+import { CacheService } from "./CacheService.js";
+
 export class RoutingEngine {
     constructor(topology) {
         this.topology = topology;
+        this.cacheService = new CacheService(topology);
     }
 
     /**
-     * Route a request through its selected edge node.
-     * A cache hit is served by that edge; cache misses (or unavailable edges)
-     * fall back to an origin that owns the requested object.
+     * Route a request through an edge node
      */
     route(request, edge) {
         const objectKey = this.normalizeObjectKey(request.objectKey);
@@ -14,21 +19,50 @@ export class RoutingEngine {
             ? this.topology.getEdge(edge)
             : edge;
 
-        if (selectedEdge && this.checkEdgeStatus(selectedEdge)) {
-            const hasCachedObject = selectedEdge.files.includes(objectKey);
-            if (hasCachedObject) {
-                return this.createRouteResult(request, objectKey, selectedEdge, "EDGE_CACHE_HIT");
+        // Count every request so the admission policy can identify popular files.
+        const requestFrequency = this.cacheService.recordRequest(objectKey);
+        const isEdgeActive = selectedEdge && selectedEdge.status === "ACTIVE";
+
+        // 1. Fresh edge cache entry: return it immediately.
+        if (isEdgeActive) {
+            const cacheEntry = selectedEdge.getCacheEntry(objectKey);
+
+            if (cacheEntry.status === "FRESH") {
+                return this.createRouteResult(request, objectKey, selectedEdge, "EDGE_CACHE_HIT", {
+                    cacheStatus: "FRESH",
+                    content: cacheEntry.value,
+                });
+            }
+
+            // 2. Stale entry: serve it now and refresh the cache from Origin.
+            if (cacheEntry.status === "STALE_BUT_SERVABLE") {
+                const origin = this.cacheService.revalidate(selectedEdge, objectKey);
+                return this.createRouteResult(request, objectKey, selectedEdge, "EDGE_CACHE_HIT", {
+                    cacheStatus: "STALE_BUT_SERVABLE",
+                    content: cacheEntry.value,
+                    revalidationTriggered: Boolean(origin),
+                });
             }
         }
 
-        const origin = this.topology
-            .getAllOrigins()
-            .find((node) => node.status === "ACTIVE" && node.files.includes(objectKey));
+        // 3. Miss or expired entry: do not serve it; fetch from Origin.
+        const origin = this.cacheService.findOrigin(objectKey);
 
         if (origin) {
-            return this.createRouteResult(request, objectKey, origin, "ORIGIN_FALLBACK");
+            // Only admit popular origin objects into the edge cache.
+            const admittedToCache = isEdgeActive && this.cacheService.shouldCache(objectKey);
+            if (admittedToCache) {
+                selectedEdge.cacheFile(objectKey, objectKey);
+            }
+            return this.createRouteResult(request, objectKey, origin, "ORIGIN_FALLBACK", {
+                cacheStatus: isEdgeActive ? "EXPIRED_OR_MISS" : "EDGE_UNAVAILABLE",
+                content: objectKey,
+                requestFrequency,
+                admittedToCache,
+            });
         }
 
+        // 3. Not found
         return {
             requestId: request.requestId,
             objectKey,
@@ -37,15 +71,12 @@ export class RoutingEngine {
         };
     }
 
-    checkEdgeStatus(edge) {
-        return edge?.status === "ACTIVE";
-    }
-
     normalizeObjectKey(objectKey) {
+        if (!objectKey) return "/";
         return objectKey.startsWith("/") ? objectKey : `/${objectKey}`;
     }
 
-    createRouteResult(request, objectKey, node, status) {
+    createRouteResult(request, objectKey, node, status, details = {}) {
         return {
             requestId: request.requestId,
             objectKey,
@@ -56,6 +87,7 @@ export class RoutingEngine {
                 type: node.type,
                 location: node.location,
             },
+            ...details,
         };
     }
 }
