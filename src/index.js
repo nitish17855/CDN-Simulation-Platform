@@ -21,6 +21,11 @@ import healthRoutes from './route/health.route.js';
  * 4. Added comprehensive comments explaining middleware stack and route mounting.
  */
 
+import { createTopology } from '../simulation/createtopology.js';
+const topology = createTopology();
+
+// start your simulation
+
 const app = express();
 
 // --------------- Global Middleware ---------------
